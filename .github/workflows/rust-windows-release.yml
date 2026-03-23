@@ -1,0 +1,202 @@
+name: Rust Windows Release
+
+# Builds the Rust CLI binaries for Windows x64 and publishes them as a
+# GitHub Release so users can download ready-to-run executables.
+#
+# Binaries produced
+# -----------------
+#   wifi-densepose.exe  — MAT/pose-estimation CLI (bundles ONNX Runtime DLLs)
+#   sensing-server.exe  — Lightweight WiFi sensing server + web UI (no heavy deps)
+#
+# Triggers
+# --------
+#   • Push a tag:  git tag rust-v0.3.0 && git push origin rust-v0.3.0
+#   • Manual run:  Actions → Rust Windows Release → Run workflow
+
+on:
+  push:
+    tags:
+      - 'rust-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string for the release (e.g. 0.3.0)'
+        required: true
+        default: '0.3.0'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: compile on a Windows runner
+  # ──────────────────────────────────────────────
+  build-windows:
+    name: Build Windows x64 Binaries
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-port/wifi-densepose-rs
+          cache-on-failure: true
+
+      # sensing-server has no heavy ML deps — pure Rust, always succeeds.
+      - name: Build sensing-server
+        working-directory: rust-port/wifi-densepose-rs
+        shell: bash
+        run: cargo build --release --target x86_64-pc-windows-msvc -p wifi-densepose-sensing-server
+
+      # wifi-densepose CLI depends on wifi-densepose-nn which links ONNX Runtime.
+      # The `bundle-onnx` feature (defined in wifi-densepose-nn) enables
+      # `ort/download-binaries` so the build script downloads the ONNX Runtime
+      # DLL automatically — no manual installation required on the runner.
+      - name: Build wifi-densepose CLI (with ONNX Runtime bundled)
+        working-directory: rust-port/wifi-densepose-rs
+        shell: bash
+        run: >
+          cargo build --release --target x86_64-pc-windows-msvc
+          -p wifi-densepose-cli
+          --features wifi-densepose-nn/bundle-onnx
+
+      # Resolve the version string from either the tag name or the manual input.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/rust-v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/rust-v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Assemble a single zip that contains the two executables plus any DLLs
+      # that ONNX Runtime placed next to the binaries (e.g. onnxruntime.dll).
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          $version  = "${{ steps.version.outputs.version }}"
+          $target   = "rust-port/wifi-densepose-rs/target/x86_64-pc-windows-msvc/release"
+          $outDir   = "release-windows"
+          New-Item -ItemType Directory -Path $outDir | Out-Null
+
+          # Copy binaries
+          Copy-Item "$target\wifi-densepose.exe"  $outDir
+          Copy-Item "$target\sensing-server.exe"  $outDir
+
+          # Copy any ONNX Runtime DLLs placed by the ort build script
+          Get-ChildItem "$target\*.dll" -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item $_.FullName $outDir }
+
+          # Full bundle (CLI + sensing-server + DLLs)
+          $bundleZip = "wifi-densepose-windows-x64-v${version}.zip"
+          Compress-Archive -Path "$outDir\*" -DestinationPath $bundleZip -Force
+          Write-Host "Created $bundleZip"
+
+          # Standalone sensing-server (no DLLs needed — pure Rust binary)
+          $ssZip = "sensing-server-windows-x64-v${version}.zip"
+          Compress-Archive -Path "$outDir\sensing-server.exe" -DestinationPath $ssZip -Force
+          Write-Host "Created $ssZip"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-densepose-rust-windows-bundle
+          path: wifi-densepose-windows-x64-*.zip
+
+      - name: Upload sensing-server artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wifi-densepose-rust-windows-sensing-server
+          path: sensing-server-windows-x64-*.zip
+
+  # ──────────────────────────────────────────────
+  # Job 2: create the GitHub Release
+  # ──────────────────────────────────────────────
+  create-release:
+    name: Create GitHub Release
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/rust-v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/rust-v}" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "tag=rust-v${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: RuView Rust v${{ steps.version.outputs.version }} — Windows x64
+          tag_name: ${{ steps.version.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          files: |
+            artifacts/**/*.zip
+          body: |
+            ## RuView Rust v${{ steps.version.outputs.version }} — Windows x64
+
+            Pre-built Rust binaries for Windows 10/11 (64-bit).
+
+            ### Downloads
+
+            | File | Contents | Requirements |
+            |------|----------|--------------|
+            | `wifi-densepose-windows-x64-v${{ steps.version.outputs.version }}.zip` | `wifi-densepose.exe` + `sensing-server.exe` + ONNX Runtime DLLs | Windows 10/11 x64 |
+            | `sensing-server-windows-x64-v${{ steps.version.outputs.version }}.zip` | `sensing-server.exe` only | Windows 10/11 x64, no extra deps |
+
+            ### Quick Start
+
+            **Sensing Server** (WiFi CSI → WebSocket bridge + web UI)
+            ```powershell
+            # Extract sensing-server-windows-x64-v${{ steps.version.outputs.version }}.zip
+            .\sensing-server.exe --http-port 8080 --udp-port 5005
+            # Then open http://localhost:8080 in a browser
+            ```
+
+            **wifi-densepose CLI** (MAT / pose-estimation commands)
+            ```powershell
+            # Extract wifi-densepose-windows-x64-v${{ steps.version.outputs.version }}.zip
+            # Keep all files (exe + DLLs) in the same folder
+            .\wifi-densepose.exe --help
+            .\wifi-densepose.exe mat scan --zone "Building A"
+            .\wifi-densepose.exe version
+            ```
+
+            ### Notes
+            - Both binaries target **x86_64-pc-windows-msvc** (64-bit Intel/AMD).
+            - `wifi-densepose.exe` requires the ONNX Runtime DLLs from the same zip — keep them in the same directory.
+            - `sensing-server.exe` is fully self-contained (no extra DLLs required).
+            - Source code: `rust-port/wifi-densepose-rs/`

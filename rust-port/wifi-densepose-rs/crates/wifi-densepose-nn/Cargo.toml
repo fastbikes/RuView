@@ -19,6 +19,9 @@ candle-backend = ["candle-core", "candle-nn"]
 cuda = ["onnx"]
 tensorrt = ["onnx"]
 all-backends = ["onnx", "tch-backend", "candle-backend"]
+# Bundles ONNX Runtime at build time so the binary is self-contained for distribution.
+# Enable when building release binaries intended for end-user download (e.g. CI release workflow).
+bundle-onnx = ["ort/download-binaries"]
 
 [dependencies]
 # Core utilities
